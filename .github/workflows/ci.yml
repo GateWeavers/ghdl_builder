@@ -1,0 +1,134 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      major:
+        description: "Major version number for the release tag (e.g. 5)"
+        required: true
+        default: "5"
+        type: string
+      minor:
+        description: "Minor version number for the release tag (e.g. 0)"
+        required: true
+        default: "0"
+        type: string
+      versions:
+        description: "Space-separated GHDL release/dev prefixes in asset names"
+        required: false
+        default: "7.0.0-dev"
+        type: string
+      backends:
+        description: "Space-separated GHDL backends"
+        required: false
+        default: "gcc llvm mcode"
+        type: string
+      distros:
+        description: "Space-separated Linux distributions"
+        required: false
+        default: "ubuntu24.04 ubuntu26.04"
+        type: string
+      arch:
+        description: "Target architecture"
+        required: false
+        default: "x86_64"
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  pin-nightly:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Resolve ghdl/ghdl nightly commit SHA
+        id: commit
+        run: |
+          set -euo pipefail
+          COMMIT_SHA=$(git ls-remote --tags https://github.com/ghdl/ghdl.git "refs/tags/nightly" | awk '{print $1}')
+          if [ -z "$COMMIT_SHA" ]; then
+            echo "Failed to resolve commit SHA for refs/tags/nightly." >&2
+            exit 1
+          fi
+
+          SHORT_SHA="${COMMIT_SHA:0:12}"
+          TAG="v${{ inputs.major }}.${{ inputs.minor }}-nightly.${SHORT_SHA}"
+
+          echo "commit_sha=$COMMIT_SHA" >> "$GITHUB_OUTPUT"
+          echo "short_sha=$SHORT_SHA" >> "$GITHUB_OUTPUT"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "Resolved nightly commit: $COMMIT_SHA (short: $SHORT_SHA, tag: $TAG)"
+
+      - name: Download target GHDL nightly archives from lists
+        id: dl
+        run: |
+          set -euo pipefail
+          DOWNLOAD_DIR="${{ runner.temp }}/nightly-assets"
+          mkdir -p "$DOWNLOAD_DIR"
+
+          read -r -a GHDL_VERSIONS <<< "${{ inputs.versions }}"
+          read -r -a GHDL_BACKENDS <<< "${{ inputs.backends }}"
+          read -r -a LINUX_DISTROS <<< "${{ inputs.distros }}"
+          ARCH="${{ inputs.arch }}"
+          BASE_URL="https://github.com/ghdl/ghdl/releases/download/nightly"
+
+          count=0
+          for ver in "${GHDL_VERSIONS[@]}"; do
+            for backend in "${GHDL_BACKENDS[@]}"; do
+              for distro in "${LINUX_DISTROS[@]}"; do
+                archive="ghdl-${backend}-${ver}-${distro}-${ARCH}.tar.gz"
+                url="${BASE_URL}/${archive}"
+                echo "Downloading $url ..."
+                curl -fL --retry 3 --retry-delay 2 "$url" -o "${DOWNLOAD_DIR}/${archive}"
+                count=$((count + 1))
+              done
+            done
+          done
+
+          if [ "$count" -eq 0 ]; then
+            echo "No archives matched the provided lists." >&2
+            exit 1
+          fi
+
+          echo "download_dir=$DOWNLOAD_DIR" >> "$GITHUB_OUTPUT"
+
+      - name: Compute Bazel checksums
+        run: |
+          set -euo pipefail
+          echo "=== Bazel Checksums (Tag: ${{ steps.commit.outputs.tag }}, Commit: ${{ steps.commit.outputs.commit_sha }}) ==="
+          for f in "${{ steps.dl.outputs.download_dir }}"/*; do
+            [ -f "$f" ] || continue
+            name="$(basename "$f")"
+            sha256_hex="$(sha256sum "$f" | awk '{print $1}')"
+            integrity="sha256-$(openssl dgst -sha256 -binary "$f" | base64 -w 0)"
+            echo "File:      $name"
+            echo "SHA-256:   $sha256_hex"
+            echo "Integrity: $integrity"
+            echo "---"
+          done
+
+      - name: Create GitHub Release for pinned nightly
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ steps.commit.outputs.tag }}
+          target_commitish: ${{ github.sha }}
+          name: "GHDL ${{ steps.commit.outputs.tag }} (nightly ${{ steps.commit.outputs.short_sha }})"
+          body: |
+            Pinned snapshot from `ghdl/ghdl` `nightly` release.
+            - **Upstream commit:** `${{ steps.commit.outputs.commit_sha }}`
+            - **Versions:** `${{ inputs.versions }}`
+            - **Backends:** `${{ inputs.backends }}`
+            - **Distros:** `${{ inputs.distros }}`
+            - **Arch:** `${{ inputs.arch }}`
+          files: ${{ steps.dl.outputs.download_dir }}/*.tar.gz
+          fail_on_unmatched_files: true
